@@ -20,6 +20,7 @@
 #import "QNNPing.h"
 
 const int kQNNInvalidPingResponse = -22001;
+const int kQNNOtherPingResponse = -22002;
 
 @interface QNNPingResult ()
 
@@ -200,7 +201,7 @@ static char *icmpInPacket(char *packet, int len) {
     return (char *)packet + ipHeaderLength;
 }
 
-static BOOL isValidResponse(char *buffer, int len, int seq, int identifier) {
+static int isValidResponse(char *buffer, int len, int seq, int identifier) {
     ICMPPacket *icmpPtr = (ICMPPacket *)icmpInPacket(buffer, len);
     if (icmpPtr == NULL) {
         return NO;
@@ -209,11 +210,20 @@ static BOOL isValidResponse(char *buffer, int len, int seq, int identifier) {
     icmpPtr->checksum = 0;
     uint16_t calculatedChecksum = in_cksum(icmpPtr, len - ((char *)icmpPtr - buffer));
 
-    return receivedChecksum == calculatedChecksum &&
+    BOOL correct = receivedChecksum == calculatedChecksum &&
            icmpPtr->type == kQNNICMPTypeEchoReply &&
            icmpPtr->code == 0 &&
-           OSSwapBigToHostInt16(icmpPtr->identifier) == identifier &&
            OSSwapBigToHostInt16(icmpPtr->sequenceNumber) <= seq;
+    
+    if (!correct) {
+        return 1;
+    }
+    
+    if (OSSwapBigToHostInt16(icmpPtr->identifier) == identifier) {
+        return 0;
+    } else {
+        return -1;
+    }
 }
 
 @interface QNNPing ()
@@ -270,9 +280,12 @@ static BOOL isValidResponse(char *buffer, int len, int seq, int identifier) {
     } else if (bytesRead == 0) {
         err = EPIPE;
     } else {
-        if (isValidResponse(buffer, (int)bytesRead, seq, identifier)) {
+        int result = isValidResponse(buffer, (int)bytesRead, seq, identifier);
+        if (result == 0) {
             *ttlOut = ((IPHeader *)buffer)->timeToLive;
             *size = (int)bytesRead;
+        } else if (result == -1) {
+            err = kQNNOtherPingResponse;
         } else {
             err = kQNNInvalidPingResponse;
         }
@@ -350,6 +363,11 @@ static BOOL isValidResponse(char *buffer, int len, int seq, int identifier) {
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
         r = [self ping:&addr seq:index identifier:identifier sock:sock ttl:&ttl size:&size];
         NSTimeInterval duration = [[NSDate date] timeIntervalSinceDate:t1];
+        
+        if (r == kQNNOtherPingResponse) {
+            continue;
+        }
+        
         if (r == 0) {
             // ignore broadcast address
             [self.output write:[NSString stringWithFormat:@"%d bytes from %s: icmp_seq=%ld ttl=%d time=%f ms\n", size, inet_ntoa(addr.sin_addr), (long)index, ttl, duration * 1000]];
@@ -360,10 +378,12 @@ static BOOL isValidResponse(char *buffer, int len, int seq, int identifier) {
         }
 
         if (index < _count && !_stopped && r == 0) {
-            [NSThread sleepForTimeInterval:0.1];
+            [NSThread sleepForTimeInterval:_interval];
         }
         close(sock);
-    } while (++index < _count && !_stopped && r == 0);
+        
+        ++index;
+    } while (index < _count && !_stopped);
 
     if (_complete) {
         NSInteger code = r;
